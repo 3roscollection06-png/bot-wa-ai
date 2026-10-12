@@ -4,8 +4,9 @@ const fetch = require('node-fetch');
 
 const FIREBASE_REST_URL = "https://target21hari-default-rtdb.asia-southeast1.firebasedatabase.app";
 const FONNTE_API_TOKEN = "tMj43cRJ5E3kHLFowY61";
+const GEMINI_API_KEY = "AQ.Ab8RN6LXcZ_zFJh5g4GAH_2fcC0X6Pv5h8632T1oqzr9HoUnMA";
 
-// Fungsi helper kirim pesan balasan WA via Fonnte
+// Helper kirim pesan WA
 async function replyWhatsApp(targetWa, message) {
   try {
     const formData = new URLSearchParams();
@@ -26,20 +27,54 @@ async function replyWhatsApp(targetWa, message) {
   }
 }
 
-// Endpoint Webhook yang didaftarkan ke Fonnte
+// Helper AI OCR untuk membaca foto Struk via Gemini API
+async function processReceiptWithAI(imageUrl) {
+  try {
+    const imgRes = await fetch(imageUrl);
+    const arrayBuffer = await imgRes.arrayBuffer();
+    const base64Image = Buffer.from(arrayBuffer).toString('base64');
+    const mimeType = imgRes.headers.get('content-type') || 'image/jpeg';
+
+    const prompt = "Analisis struk belanja ini. Kembalikan HANYA format JSON valid tanpa tanda backtick atau markdown berikut: {\"amount\": 54500, \"store\": \"Nama Toko/Merchant\", \"items\": \"Deskripsi singkat barang\"}. Pastikan amount berupa angka integer murni tanpa titik/koma/simbol.";
+    
+    const geminiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { text: prompt },
+            { inline_data: { mime_type: mimeType, data: base64Image } }
+          ]
+        }]
+      })
+    });
+
+    const geminiData = await geminiRes.json();
+    const textResponse = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const cleanJsonText = textResponse.replace(/```json/g, '').replace(/```/g, '').trim();
+    
+    return JSON.parse(cleanJsonText);
+  } catch (err) {
+    console.error("Gagal analisis OCR Struk:", err);
+    return null;
+  }
+}
+
 router.post('/', async (req, res) => {
   try {
     const incoming = req.body;
     const senderWa = incoming.sender || incoming.from;
-    const messageText = (incoming.message || '').trim();
+    let messageText = (incoming.message || incoming.caption || '').trim();
+    const mediaUrl = incoming.url || incoming.media || incoming.image || null;
 
-    if (!senderWa || !messageText) {
-      return res.status(400).json({ status: false, reason: 'Pesan atau pengirim kosong' });
+    if (!senderWa) {
+      return res.status(400).json({ status: false, reason: 'Pengirim kosong' });
     }
 
-    console.log(`📥 [PESAN MASUK DARI WA] ${senderWa}: ${messageText}`);
+    console.log(`📥 [PESAN MASUK] ${senderWa}: ${messageText} ${mediaUrl ? '(Ada Gambar)' : ''}`);
 
-    // 1. Cari pengguna di Firebase berdasarkan nomor WhatsApp
+    // 1. Cari pengguna di Firebase
     const usersRes = await fetch(`${FIREBASE_REST_URL}/users.json`);
     const usersData = await usersRes.json();
 
@@ -62,7 +97,7 @@ router.post('/', async (req, res) => {
     }
 
     if (!matchedUserData) {
-      await replyWhatsApp(senderWa, "⚠️ Maaf, nomor WhatsApp Anda belum terdaftar di aplikasi Focus Est 2026. Silakan daftar terlebih dahulu di aplikasi.");
+      await replyWhatsApp(senderWa, "⚠️ Maaf, nomor WhatsApp Anda belum terdaftar di aplikasi Focus Est 2026.");
       return res.status(200).json({ status: true, info: 'User not found' });
     }
 
@@ -70,18 +105,16 @@ router.post('/', async (req, res) => {
     const formatRupiah = (num) => new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(num);
     const todayDate = new Date().toISOString().split('T')[0];
 
-    // 2. CEK APAKAH USER MEMINTA LAPORAN / REKAP
+    // 2. CEK LAPORAN / REKAP
     if (lowerMsg.includes('laporan') || lowerMsg.includes('rekap') || lowerMsg.includes('pembukuan')) {
-      // Ambil data transaksi user
       const dataRes = await fetch(`${FIREBASE_REST_URL}/user_data/${matchedUserEmailKey}.json`);
       let currentAppData = await dataRes.json() || {};
       const transactions = currentAppData.duitTransactions || [];
 
-      // Filter transaksi hari ini
       const todayTransactions = transactions.filter(tx => tx.date === todayDate);
 
       if (todayTransactions.length === 0) {
-        await replyWhatsApp(senderWa, `📊 *REKAP PEMBUKUAN HARI INI*\nTanggal: ${todayDate}\n\nBelum ada transaksi yang tercatat hari ini.\n\nKetik:\n• *Masuk [nominal] [ket]*\n• *Keluar [nominal] [ket]*`);
+        await replyWhatsApp(senderWa, `📊 *REKAP PEMBUKUAN HARI INI*\nTanggal: ${todayDate}\n\nBelum ada transaksi yang tercatat hari ini.`);
         return res.status(200).json({ status: true, message: 'No transactions today' });
       }
 
@@ -107,7 +140,52 @@ router.post('/', async (req, res) => {
       return res.status(200).json({ status: true, message: 'Report sent successfully' });
     }
 
-    // 3. Parser Pencatatan Keuangan (Masuk / Keluar)
+    // 3. JIKA USER MENGIRIM FOTO STRUK TANPA TEKS
+    if (mediaUrl) {
+      await replyWhatsApp(senderWa, "🔍 *Bot AI sedang membaca foto struk belanja Anda...*");
+
+      const aiResult = await processReceiptWithAI(mediaUrl);
+
+      if (aiResult && aiResult.amount > 0) {
+        const amount = aiResult.amount;
+        const storeName = aiResult.store || "Belanja Struk";
+        const desc = `Belanja di ${storeName}`;
+
+        const newTx = {
+          id: 'dt_' + Date.now(),
+          type: 'expense',
+          amount: amount,
+          date: todayDate,
+          desc: desc,
+          receiptUrl: mediaUrl
+        };
+
+        const dataRes = await fetch(`${FIREBASE_REST_URL}/user_data/${matchedUserEmailKey}.json`);
+        let currentAppData = await dataRes.json() || {};
+
+        if (!currentAppData.duitTransactions) {
+          currentAppData.duitTransactions = [];
+        }
+
+        currentAppData.duitTransactions.unshift(newTx);
+
+        await fetch(`${FIREBASE_REST_URL}/user_data/${matchedUserEmailKey}.json`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(currentAppData)
+        });
+
+        const replyText = `✅ *STRUK DIBACA & DICATAT OLEH BOT AI!*\n\n💸 Jenis: Pengeluaran (-)\n🏬 Toko/Merchant: *${storeName}*\n💰 Nominal: *${formatRupiah(amount)}*\n📅 Tanggal: ${newTx.date}\n\n_Data telah disinkronkan otomatis ke Duit Tracker akun Anda._`;
+        
+        await replyWhatsApp(senderWa, replyText);
+        return res.status(200).json({ status: true, message: 'Receipt auto recorded with Gemini AI' });
+      } else {
+        await replyWhatsApp(senderWa, "⚠️ *Gagal membaca struk.* Pastikan foto struk terang dan nominal angkanya terlihat jelas.");
+        return res.status(200).json({ status: true, message: 'OCR failed' });
+      }
+    }
+
+    // 4. Parser Teks Biasa (Masuk / Keluar)
     let type = null;
     if (lowerMsg.includes('masuk') || lowerMsg.includes('terima') || lowerMsg.includes('pendapatan')) {
       type = 'income';
@@ -133,7 +211,7 @@ router.post('/', async (req, res) => {
 
         const dataRes = await fetch(`${FIREBASE_REST_URL}/user_data/${matchedUserEmailKey}.json`);
         let currentAppData = await dataRes.json() || {};
-        
+
         if (!currentAppData.duitTransactions) {
           currentAppData.duitTransactions = [];
         }
@@ -153,8 +231,8 @@ router.post('/', async (req, res) => {
       }
     }
 
-    // Jika pesan berupa teks biasa atau sapaan selain perintah laporan/catat
-    await replyWhatsApp(senderWa, `Halo *${matchedUserData.name}*! Bot WA AI Focus Est 2026 menerima pesan Anda.\n\n📌 *Perintah yang tersedia:*\n1. Catat Transaksi:\n   • "Masuk 50000 jual produk"\n   • "Keluar 15000 beli bensin"\n2. Lihat Laporan:\n   • "Laporan hari ini" / "Rekap"`);
+    // Pesan Default
+    await replyWhatsApp(senderWa, `Halo *${matchedUserData.name}*! Bot WA AI Focus Est 2026 menerima pesan Anda.\n\n📌 *Fitur Otomatis:*\n• *Foto Struk Belanja:* Cukup kirimkan foto struk belanja, bot AI akan membaca dan mencatat nominalnya secara otomatis!\n• *Manual:* "Masuk 50000" / "Keluar 15000"\n• *Laporan:* Ketik "Laporan hari ini" / "Rekap"`);
     return res.status(200).json({ status: true, message: 'General message processed' });
 
   } catch (error) {
