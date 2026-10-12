@@ -1,0 +1,17 @@
+{
+  "name": "focus-wa-bot-webhook",
+  "version": "1.0.0",
+  "description": "Webhook Fonnte Bot WA AI untuk Duit Tracker Focus Est 2026",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "body-parser": "^1.20.2",
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0"
+  },
+  "engines": {
+    "node": ">=18.x"
+  }
+}
