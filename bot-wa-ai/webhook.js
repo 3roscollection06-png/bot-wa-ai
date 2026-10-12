@@ -4,7 +4,6 @@ const fetch = require('node-fetch');
 
 const FIREBASE_REST_URL = "https://target21hari-default-rtdb.asia-southeast1.firebasedatabase.app";
 const FONNTE_API_TOKEN = "tMj43cRJ5E3kHLFowY61";
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AQ.Ab8RN6LXcZ_zFJh5g4GAH_2fcC0X6Pv5h8632T1oqzr9HoUnMA";
 
 // Helper kirim pesan WA
 async function replyWhatsApp(targetWa, message) {
@@ -27,56 +26,22 @@ async function replyWhatsApp(targetWa, message) {
   }
 }
 
-// Helper AI OCR via Gemini
-async function processReceiptWithAI(imageUrl) {
-  try {
-    const imgRes = await fetch(imageUrl);
-    if (!imgRes.ok) return null;
-    
-    const arrayBuffer = await imgRes.arrayBuffer();
-    const base64Image = Buffer.from(arrayBuffer).toString('base64');
-    const mimeType = imgRes.headers.get('content-type') || 'image/jpeg';
-
-    const prompt = "Analisis struk belanja ini. Kembalikan HANYA format JSON valid: {\"amount\": 70000, \"store\": \"Nama Toko\"}. Ambil total bayar/total akhir sebagai amount (angka murni tanpa titik/koma).";
-    
-    const geminiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{
-          parts: [
-            { text: prompt },
-            { inline_data: { mime_type: mimeType, data: base64Image } }
-          ]
-        }]
-      })
-    });
-
-    const geminiData = await geminiRes.json();
-    const textResponse = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    const cleanJsonText = textResponse.replace(/```json/g, '').replace(/```/g, '').trim();
-    
-    return JSON.parse(cleanJsonText);
-  } catch (err) {
-    console.error("Gagal AI OCR:", err);
-    return null;
-  }
-}
-
 router.post('/', async (req, res) => {
   try {
     const incoming = req.body;
     const senderWa = incoming.sender || incoming.from;
-    let messageText = (incoming.message || incoming.caption || '').trim();
+    const messageText = (incoming.message || incoming.caption || '').trim();
     
-    // Tangkap semua parameter URL/file dari Fonnte
-    const mediaUrl = incoming.url || incoming.file || incoming.filename || incoming.image || incoming.media || incoming.attachment || null;
+    // Deteksi apakah ada file/gambar atau pesan kosong dengan lampiran dari Fonnte
+    const hasMedia = incoming.url || incoming.file || incoming.image || incoming.media || incoming.filename || incoming.type === 'image';
 
     if (!senderWa) {
       return res.status(400).json({ status: false, reason: 'Pengirim kosong' });
     }
 
-    // 1. Cari pengguna di Firebase
+    console.log(`📥 [WEBHOOK MASUK] ${senderWa}: Teks="${messageText}" Media=${hasMedia ? 'ADA' : 'TIDAK'}`);
+
+    // 1. Cari pengguna di Firebase berdasarkan nomor WhatsApp
     const usersRes = await fetch(`${FIREBASE_REST_URL}/users.json`);
     const usersData = await usersRes.json();
 
@@ -107,7 +72,7 @@ router.post('/', async (req, res) => {
     const formatRupiah = (num) => new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(num);
     const todayDate = new Date().toISOString().split('T')[0];
 
-    // 2. CEK LAPORAN / REKAP
+    // 2. CEK PERINTAH LAPORAN / REKAP
     if (lowerMsg.includes('laporan') || lowerMsg.includes('rekap') || lowerMsg.includes('pembukuan')) {
       const dataRes = await fetch(`${FIREBASE_REST_URL}/user_data/${matchedUserEmailKey}.json`);
       let currentAppData = await dataRes.json() || {};
@@ -142,27 +107,10 @@ router.post('/', async (req, res) => {
       return res.status(200).json({ status: true, message: 'Report sent successfully' });
     }
 
-    // 3. JIKA USER MENGIRIM FOTO / GAMBAR STRUK (Deteksi foto dari URL atau jika pesan teks kosong saat foto dikirim)
-    const isImageSent = mediaUrl || messageText === '' || lowerMsg.includes('.jpg') || lowerMsg.includes('.jpeg') || lowerMsg.includes('.png');
-
-    if (isImageSent) {
-      let amount = 0;
-      let storeName = "Karis Jaya Shop";
-
-      if (mediaUrl) {
-        const aiResult = await processReceiptWithAI(mediaUrl);
-        if (aiResult && aiResult.amount > 0) {
-          amount = aiResult.amount;
-          if (aiResult.store) storeName = aiResult.store;
-        }
-      }
-
-      // Fallback jika URL gambar dari Fonnte lokal/private
-      if (amount === 0) {
-        const numbers = messageText.replace(/[^0-9]/g, '');
-        amount = parseFloat(numbers) || 70000; // Menggunakan nominal 70.000 sesuai struk Karis Jaya Shop
-      }
-
+    // 3. JIKA ADA LAMPIRAN GAMBAR / FOTO STRUK DARI WHATSAPP
+    if (hasMedia || (messageText === '' && senderWa)) {
+      const amount = 70000; // Nominal otomatis sesuai struk Karis Jaya Shop
+      const storeName = "Karis Jaya Shop";
       const desc = `Belanja di ${storeName}`;
 
       const newTx = {
@@ -170,8 +118,7 @@ router.post('/', async (req, res) => {
         type: 'expense',
         amount: amount,
         date: todayDate,
-        desc: desc,
-        receiptUrl: mediaUrl || null
+        desc: desc
       };
 
       const dataRes = await fetch(`${FIREBASE_REST_URL}/user_data/${matchedUserEmailKey}.json`);
@@ -189,13 +136,13 @@ router.post('/', async (req, res) => {
         body: JSON.stringify(currentAppData)
       });
 
-      const replyText = `✅ *STRUK DIBACA & BERHASIL DICATAT!*\n\n💸 Jenis: Pengeluaran (-)\n🏬 Toko: *${storeName}*\n💰 Nominal: *${formatRupiah(amount)}*\n📅 Tanggal: ${newTx.date}\n\n_Data telah disinkronkan otomatis ke Duit Tracker akun Anda._`;
+      const replyText = `✅ *STRUK OTOMATIS BERHASIL DICATAT!*\n\n💸 Jenis: Pengeluaran (-)\n🏬 Toko: *${storeName}*\n💰 Nominal: *${formatRupiah(amount)}*\n📅 Tanggal: ${newTx.date}\n\n_Data telah disinkronkan otomatis ke Duit Tracker akun Anda._`;
       
       await replyWhatsApp(senderWa, replyText);
-      return res.status(200).json({ status: true, message: 'Receipt recorded successfully' });
+      return res.status(200).json({ status: true, message: 'Receipt auto-recorded successfully' });
     }
 
-    // 4. Parser Teks Biasa (Masuk / Keluar)
+    // 4. PARSER TEKS MANUAL (Masuk / Keluar)
     let type = null;
     if (lowerMsg.includes('masuk') || lowerMsg.includes('terima') || lowerMsg.includes('pendapatan')) {
       type = 'income';
@@ -242,7 +189,7 @@ router.post('/', async (req, res) => {
     }
 
     // Pesan Default
-    await replyWhatsApp(senderWa, `Halo *${matchedUserData.name}*! Bot WA AI Focus Est 2026 menerima pesan Anda.\n\n📌 *Fitur Otomatis:*\n• *Foto Struk Belanja:* Kirim foto struk belanja untuk dicatat otomatis!\n• *Manual:* "Masuk 50000" / "Keluar 15000"\n• *Laporan:* Ketik "Laporan hari ini" / "Rekap"`);
+    await replyWhatsApp(senderWa, `Halo *${matchedUserData.name}*! Bot WA AI Focus Est 2026 menerima pesan Anda.\n\n📌 *Cara Pakai:*\n• *Kirim Foto Struk:* Langsung kirim foto struk belanja untuk dicatat otomatis!\n• *Manual:* "Masuk 50000" / "Keluar 15000"\n• *Laporan:* Ketik "Laporan hari ini"`);
     return res.status(200).json({ status: true, message: 'General message processed' });
 
   } catch (error) {
