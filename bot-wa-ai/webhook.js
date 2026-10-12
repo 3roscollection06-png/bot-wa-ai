@@ -30,7 +30,6 @@ async function replyWhatsApp(targetWa, message) {
 router.post('/', async (req, res) => {
   try {
     const incoming = req.body;
-    // Fonnte mengirim parameter: sender (nomor pengirim), message (pesan teks)
     const senderWa = incoming.sender || incoming.from;
     const messageText = (incoming.message || '').trim();
 
@@ -51,7 +50,6 @@ router.post('/', async (req, res) => {
       for (const key of Object.keys(usersData)) {
         const u = usersData[key];
         if (u && u.whatsapp) {
-          // Normalisasi nomor untuk pencocokan
           const cleanUserWa = u.whatsapp.replace(/[^0-9]/g, '');
           const cleanSender = senderWa.replace(/[^0-9]/g, '');
           if (cleanSender.endsWith(cleanUserWa) || cleanUserWa.endsWith(cleanSender)) {
@@ -68,9 +66,48 @@ router.post('/', async (req, res) => {
       return res.status(200).json({ status: true, info: 'User not found' });
     }
 
-    // 2. Parser AI Sederhana untuk Perintah Duit Tracker
-    // Contoh format pesan: "masuk 100000 gaji bulanan" atau "keluar 25000 beli makan siang"
     const lowerMsg = messageText.toLowerCase();
+    const formatRupiah = (num) => new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(num);
+    const todayDate = new Date().toISOString().split('T')[0];
+
+    // 2. CEK APAKAH USER MEMINTA LAPORAN / REKAP
+    if (lowerMsg.includes('laporan') || lowerMsg.includes('rekap') || lowerMsg.includes('pembukuan')) {
+      // Ambil data transaksi user
+      const dataRes = await fetch(`${FIREBASE_REST_URL}/user_data/${matchedUserEmailKey}.json`);
+      let currentAppData = await dataRes.json() || {};
+      const transactions = currentAppData.duitTransactions || [];
+
+      // Filter transaksi hari ini
+      const todayTransactions = transactions.filter(tx => tx.date === todayDate);
+
+      if (todayTransactions.length === 0) {
+        await replyWhatsApp(senderWa, `📊 *REKAP PEMBUKUAN HARI INI*\nTanggal: ${todayDate}\n\nBelum ada transaksi yang tercatat hari ini.\n\nKetik:\n• *Masuk [nominal] [ket]*\n• *Keluar [nominal] [ket]*`);
+        return res.status(200).json({ status: true, message: 'No transactions today' });
+      }
+
+      let totalIncome = 0;
+      let totalExpense = 0;
+      let reportList = `📊 *REKAP PEMBUKUAN HARI INI*\n📅 ${todayDate}\n\n`;
+
+      todayTransactions.forEach((tx, index) => {
+        const isIncome = tx.type === 'income';
+        if (isIncome) totalIncome += tx.amount;
+        else totalExpense += tx.amount;
+
+        reportList += `${index + 1}. ${isIncome ? '💰 (+)' : '💸 (-)'} *${formatRupiah(tx.amount)}*\n   📝 ${tx.desc}\n`;
+      });
+
+      const netBalance = totalIncome - totalExpense;
+      reportList += `\n---------------------------\n`;
+      reportList += `🟢 Total Masuk: *${formatRupiah(totalIncome)}*\n`;
+      reportList += `🔴 Total Keluar: *${formatRupiah(totalExpense)}*\n`;
+      reportList += `💼 *Saldo Bersih: ${formatRupiah(netBalance)}*`;
+
+      await replyWhatsApp(senderWa, reportList);
+      return res.status(200).json({ status: true, message: 'Report sent successfully' });
+    }
+
+    // 3. Parser Pencatatan Keuangan (Masuk / Keluar)
     let type = null;
     if (lowerMsg.includes('masuk') || lowerMsg.includes('terima') || lowerMsg.includes('pendapatan')) {
       type = 'income';
@@ -79,25 +116,21 @@ router.post('/', async (req, res) => {
     }
 
     if (type) {
-      // Ekstrak angka / nominal uang dari teks pesan
       const numbers = messageText.replace(/[^0-9]/g, '');
       const amount = parseFloat(numbers) || 0;
 
       if (amount > 0) {
-        // Ambil sisa teks sebagai keterangan
         let desc = messageText.replace(/(masuk|keluar|beli|bayar|terima|pendapatan|rp|\.|,|idr)/gi, '').trim();
-        // Bersihkan angka dari string deskripsi
         desc = desc.replace(/[0-9]/g, '').trim() || "Transaksi via Bot WA AI";
 
         const newTx = {
           id: 'dt_' + Date.now(),
           type: type,
           amount: amount,
-          date: new Date().toISOString().split('T')[0],
+          date: todayDate,
           desc: desc
         };
 
-        // Ambil data user_data saat ini
         const dataRes = await fetch(`${FIREBASE_REST_URL}/user_data/${matchedUserEmailKey}.json`);
         let currentAppData = await dataRes.json() || {};
         
@@ -105,17 +138,14 @@ router.post('/', async (req, res) => {
           currentAppData.duitTransactions = [];
         }
 
-        // Masukkan transaksi baru ke paling depan array
         currentAppData.duitTransactions.unshift(newTx);
 
-        // Simpan kembali ke Firebase Realtime Database
         await fetch(`${FIREBASE_REST_URL}/user_data/${matchedUserEmailKey}.json`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(currentAppData)
         });
 
-        const formatRupiah = (num) => new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(num);
         const replyText = `✅ *BERHASIL DICATAT OLEH BOT AI!*\n\nJenis: ${type === 'income' ? '💰 Pemasukan (+)' : '💸 Pengeluaran (-)'}\nNominal: *${formatRupiah(amount)}*\nKeterangan: ${desc}\nTanggal: ${newTx.date}\n\n_Data telah disinkronkan otomatis ke Duit Tracker akun Anda._`;
         
         await replyWhatsApp(senderWa, replyText);
@@ -123,8 +153,8 @@ router.post('/', async (req, res) => {
       }
     }
 
-    // Jika pesan berupa teks biasa atau sapaan
-    await replyWhatsApp(senderWa, `Halo *${matchedUserData.name}*! Bot WA AI Focus Est 2026 menerima pesan Anda. \n\nKetik format pencatatan keuangan:\n• "Masuk 50000 jual produk"\n• "Keluar 15000 beli bensin"`);
+    // Jika pesan berupa teks biasa atau sapaan selain perintah laporan/catat
+    await replyWhatsApp(senderWa, `Halo *${matchedUserData.name}*! Bot WA AI Focus Est 2026 menerima pesan Anda.\n\n📌 *Perintah yang tersedia:*\n1. Catat Transaksi:\n   • "Masuk 50000 jual produk"\n   • "Keluar 15000 beli bensin"\n2. Lihat Laporan:\n   • "Laporan hari ini" / "Rekap"`);
     return res.status(200).json({ status: true, message: 'General message processed' });
 
   } catch (error) {
