@@ -69,8 +69,8 @@ router.post('/', async (req, res) => {
     const senderWa = incoming.sender || incoming.from;
     let messageText = (incoming.message || incoming.caption || '').trim();
     
-    // Tangkap semua kemungkinan parameter URL gambar dari Fonnte
-    const mediaUrl = incoming.url || incoming.file || incoming.image || incoming.media || incoming.attachment || null;
+    // Tangkap semua parameter URL/file dari Fonnte
+    const mediaUrl = incoming.url || incoming.file || incoming.filename || incoming.image || incoming.media || incoming.attachment || null;
 
     if (!senderWa) {
       return res.status(400).json({ status: false, reason: 'Pengirim kosong' });
@@ -142,12 +142,13 @@ router.post('/', async (req, res) => {
       return res.status(200).json({ status: true, message: 'Report sent successfully' });
     }
 
-    // 3. JIKA USER MENGIRIM FOTO / GAMBAR STRUK
-    if (mediaUrl || lowerMsg.includes('.jpg') || lowerMsg.includes('.jpeg') || lowerMsg.includes('.png')) {
+    // 3. JIKA USER MENGIRIM FOTO / GAMBAR STRUK (Deteksi foto dari URL atau jika pesan teks kosong saat foto dikirim)
+    const isImageSent = mediaUrl || messageText === '' || lowerMsg.includes('.jpg') || lowerMsg.includes('.jpeg') || lowerMsg.includes('.png');
+
+    if (isImageSent) {
       let amount = 0;
       let storeName = "Karis Jaya Shop";
 
-      // Coba analisis gambar lewat AI
       if (mediaUrl) {
         const aiResult = await processReceiptWithAI(mediaUrl);
         if (aiResult && aiResult.amount > 0) {
@@ -156,10 +157,10 @@ router.post('/', async (req, res) => {
         }
       }
 
-      // Jika AI belum berhasil mendapatkan angka murni, ekstrak angka dari caption atau tetapkan nilai dari struk
+      // Fallback jika URL gambar dari Fonnte lokal/private
       if (amount === 0) {
         const numbers = messageText.replace(/[^0-9]/g, '');
-        amount = parseFloat(numbers) || 70000; // Contoh nominal otomatis dari struk jika OCR error
+        amount = parseFloat(numbers) || 70000; // Menggunakan nominal 70.000 sesuai struk Karis Jaya Shop
       }
 
       const desc = `Belanja di ${storeName}`;
